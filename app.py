@@ -1,5 +1,5 @@
-# app.py — Cars only + forward line-cross count + box turns GREEN after crossing
-# Cloud-safe: no lap/bytetrack. YOLO detect + lightweight tracker.
+# app.py — Presentable Dashboard (Cars only + forward crossing + green after crossing)
+# Cloud-safe: YOLO detect (.predict) + lightweight tracker (no lap/bytetrack).
 #
 # requirements.txt:
 # streamlit
@@ -9,7 +9,7 @@
 # pandas
 
 import os, json, time, tempfile
-from collections import defaultdict, deque
+from collections import deque
 
 import cv2
 import numpy as np
@@ -18,10 +18,14 @@ import streamlit as st
 from ultralytics import YOLO
 
 CAR_CLASS_ID = 2  # COCO car
-YELLOW = (0, 255, 255)   # before crossing
-GREEN  = (0, 255, 0)     # after crossing
-CYAN   = (255, 255, 0)   # line
+
+# Colors (OpenCV BGR)
+YELLOW = (0, 255, 255)  # before counted
+GREEN  = (0, 255, 0)    # counted
+CYAN   = (255, 255, 0)  # line
 WHITE  = (255, 255, 255)
+
+# ------------------------- Utils -------------------------
 
 def make_writer(path, fps, w, h):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -48,15 +52,15 @@ def side_of_line(px, py, x1, y1, x2, y2):
     # sign of cross product
     return (x2-x1)*(py-y1) - (y2-y1)*(px-x1)
 
+# ------------------------- Tracker -------------------------
+
 class CarTracker:
     """
-    Lightweight tracker good enough to:
-    - maintain stable-ish IDs
-    - detect line crossing
-    - mark crossed cars so box becomes GREEN
+    Lightweight tracker:
+    - Greedy IoU then centroid distance
+    - Keeps 'crossed' state so boxes stay green after counting
     """
-    def __init__(self, fps, max_age=20, iou_thr=0.25, max_dist_px=80.0):
-        self.fps = fps
+    def __init__(self, max_age=20, iou_thr=0.25, max_dist_px=80.0):
         self.max_age = max_age
         self.iou_thr = iou_thr
         self.max_dist = max_dist_px
@@ -70,15 +74,15 @@ class CarTracker:
             "id": tid,
             "bbox": det["bbox"],
             "cx": det["cx"], "cy": det["cy"],
-            "last_frame": det["frame"],
-            "crossed": False,
             "prev_cx": det["cx"], "prev_cy": det["cy"],
             "prev_side": None,
+            "last_frame": det["frame"],
+            "crossed": False,
         }
         return tid
 
     def update(self, dets, frame_idx):
-        # remove dead
+        # remove stale tracks
         dead = [tid for tid,tr in self.tracks.items() if frame_idx - tr["last_frame"] > self.max_age]
         for tid in dead:
             del self.tracks[tid]
@@ -91,9 +95,9 @@ class CarTracker:
         used = set()
         matches = []
 
-        # IoU match
+        # IoU candidates
         cand = []
-        for di,d in enumerate(dets):
+        for di, d in enumerate(dets):
             for tid in track_ids:
                 if tid in used:
                     continue
@@ -109,7 +113,7 @@ class CarTracker:
             used.add(tid); unmatched.remove(di)
             matches.append((tid, di))
 
-        # centroid distance match
+        # centroid fallback
         for di in list(unmatched):
             d = dets[di]
             best = None
@@ -125,7 +129,7 @@ class CarTracker:
                 used.add(tid); unmatched.remove(di)
                 matches.append((tid, di))
 
-        # apply updates
+        # update matched
         for tid, di in matches:
             d = dets[di]
             tr = self.tracks[tid]
@@ -145,12 +149,15 @@ class CarTracker:
 
         return dets
 
+# ------------------------- Core Analysis -------------------------
 
 def analyze(
-    video_path, outdir, model_name, conf, iou, imgsz,
+    video_path, outdir,
+    model_name, conf, iou, imgsz,
     max_frames, downscale, preview_every_n,
     line_orientation, line_pos_frac, forward_direction,
-    tracker_cfg, live_img, live_panel
+    tracker_cfg,
+    live_img_slot, live_metrics_slot, progress_bar
 ):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -161,9 +168,10 @@ def analyze(
     h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-    w = int(w0 * downscale); h = int(h0 * downscale)
+    w = int(w0 * downscale)
+    h = int(h0 * downscale)
     if w <= 0 or h <= 0:
-        w,h = w0,h0
+        w, h = w0, h0
         downscale = 1.0
 
     model = YOLO(model_name)
@@ -172,26 +180,29 @@ def analyze(
     writer = make_writer(annotated, fps, w, h)
 
     tracker = CarTracker(
-        fps=fps,
         max_age=tracker_cfg["max_age"],
         iou_thr=tracker_cfg["iou_thr"],
-        max_dist_px=tracker_cfg["max_dist_px"] * downscale
+        max_dist_px=tracker_cfg["max_dist_px"] * downscale,
     )
 
-    # Define counting line
+    # define count line
     if line_orientation == "Horizontal":
         y_line = int(line_pos_frac * h)
-        x1,y1,x2,y2 = 0,y_line,w-1,y_line
+        x1, y1, x2, y2 = 0, y_line, w-1, y_line
+        x_line = None
     else:
         x_line = int(line_pos_frac * w)
-        x1,y1,x2,y2 = x_line,0,x_line,h-1
+        x1, y1, x2, y2 = x_line, 0, x_line, h-1
+        y_line = None
 
-    # Count
     flow_count = 0
     rows = []
-
     t0 = time.time()
     fidx = 0
+
+    # for presentable rate metric
+    last_ui_time = time.time()
+    last_ui_frame = 0
 
     while True:
         ok, frame = cap.read()
@@ -201,12 +212,11 @@ def analyze(
             break
 
         if downscale != 1.0:
-            frame = cv2.resize(frame, (w,h), interpolation=cv2.INTER_AREA)
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
 
         res = model.predict(frame, conf=conf, iou=iou, imgsz=imgsz, verbose=False)[0]
 
         dets = []
-        # Only CAR detections
         if res.boxes is not None and res.boxes.xyxy is not None:
             xyxy = res.boxes.xyxy.cpu().numpy()
             cls = res.boxes.cls.cpu().numpy().astype(int)
@@ -226,75 +236,102 @@ def analyze(
 
         dets = tracker.update(dets, fidx)
 
-        # draw counting line
-        cv2.line(frame, (x1,y1), (x2,y2), CYAN, 3)
-        cv2.putText(frame, "COUNT LINE", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, CYAN, 2)
+        # draw count line
+        cv2.line(frame, (x1, y1), (x2, y2), CYAN, 3)
+        line_label = f"COUNT LINE • Forward: {forward_direction}"
+        cv2.putText(frame, line_label, (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, CYAN, 2)
 
-        # crossing logic per track
+        # apply crossing logic + draw
+        cars_in_frame = 0
+        counted_total = 0
+
         for d in dets:
+            cars_in_frame += 1
             tid = int(d["track_id"])
             tr = tracker.tracks.get(tid)
             if tr is None:
                 continue
 
-            # compute side now
-            side_now = side_of_line(tr["cx"], tr["cy"], x1,y1,x2,y2)
+            # update side sign
+            side_now = side_of_line(tr["cx"], tr["cy"], x1, y1, x2, y2)
             side_prev = tr["prev_side"]
-            tr["prev_side"] = side_now  # store for next loop
+            tr["prev_side"] = side_now
 
-            # Determine forward crossing direction
-            crossed_now = False
+            crossed_this_frame = False
+
+            # detect sign flip (crossing)
             if side_prev is not None and (side_prev == 0 or side_now == 0 or (side_prev > 0) != (side_now > 0)):
-                # For horizontal line:
-                #   above -> below means cy increased past y_line
-                # For vertical line:
-                #   left  -> right means cx increased past x_line
                 if line_orientation == "Horizontal":
-                    moved_forward = (tr["prev_cy"] < y_line and tr["cy"] >= y_line) if forward_direction == "Down" \
-                                    else (tr["prev_cy"] > y_line and tr["cy"] <= y_line)
+                    # forward: Down = above->below, Up = below->above
+                    if forward_direction == "Down":
+                        moved_forward = (tr["prev_cy"] < y_line and tr["cy"] >= y_line)
+                    else:
+                        moved_forward = (tr["prev_cy"] > y_line and tr["cy"] <= y_line)
                 else:
-                    moved_forward = (tr["prev_cx"] < x_line and tr["cx"] >= x_line) if forward_direction == "Right" \
-                                    else (tr["prev_cx"] > x_line and tr["cx"] <= x_line)
+                    # vertical: Right = left->right, Left = right->left
+                    if forward_direction == "Right":
+                        moved_forward = (tr["prev_cx"] < x_line and tr["cx"] >= x_line)
+                    else:
+                        moved_forward = (tr["prev_cx"] > x_line and tr["cx"] <= x_line)
 
                 if moved_forward and not tr["crossed"]:
                     tr["crossed"] = True
                     flow_count += 1
-                    crossed_now = True
+                    crossed_this_frame = True
 
-            # draw box: yellow before crossing, green after crossing
             color = GREEN if tr["crossed"] else YELLOW
-            x1b,y1b,x2b,y2b = map(int, tr["bbox"].tolist())
-            cv2.rectangle(frame, (x1b,y1b), (x2b,y2b), color, 3)
+            if tr["crossed"]:
+                counted_total += 1
 
-            label = f"car  #{tid}" + ("  ✅" if tr["crossed"] else "")
-            cv2.putText(frame, label, (x1b, max(24, y1b-8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+            x1b, y1b, x2b, y2b = map(int, tr["bbox"].tolist())
+            cv2.rectangle(frame, (x1b, y1b), (x2b, y2b), color, 3)
+
+            label = f"CAR  #{tid}" + ("  COUNTED" if tr["crossed"] else "")
+            cv2.putText(frame, label, (x1b, max(24, y1b-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.75, color, 2)
+
+            if crossed_this_frame:
+                cv2.putText(frame, "+1", (x2b+6, y1b+22), cv2.FONT_HERSHEY_SIMPLEX, 0.9, GREEN, 3)
 
             rows.append({
                 "frame": fidx,
                 "track_id": tid,
                 "conf": float(d["conf"]),
-                "x1": float(tr["bbox"][0]), "y1": float(tr["bbox"][1]),
-                "x2": float(tr["bbox"][2]), "y2": float(tr["bbox"][3]),
-                "cx": float(tr["cx"]), "cy": float(tr["cy"]),
+                "cx": float(tr["cx"]),
+                "cy": float(tr["cy"]),
+                "x1": float(tr["bbox"][0]),
+                "y1": float(tr["bbox"][1]),
+                "x2": float(tr["bbox"][2]),
+                "y2": float(tr["bbox"][3]),
                 "crossed": bool(tr["crossed"]),
-                "crossed_this_frame": bool(crossed_now),
+                "crossed_this_frame": bool(crossed_this_frame),
             })
 
-        # HUD
-        cv2.putText(frame, f"Cars crossed (forward): {flow_count}",
-                    (10, h-20), cv2.FONT_HERSHEY_SIMPLEX, 0.9, WHITE, 2)
-        cv2.putText(frame, f"Frame {fidx}/{total_frames if total_frames else '?'}",
-                    (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.8, WHITE, 2)
+        # bottom HUD
+        cv2.putText(frame, f"FORWARD CAR COUNT: {flow_count}", (12, h-18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.95, WHITE, 2)
 
         writer.write(frame)
 
-        if preview_every_n <= 1 or fidx % preview_every_n == 0:
-            live_img.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
-            live_panel.markdown("### Live Counts")
-            live_panel.metric("Forward car crossings", flow_count)
-            live_panel.metric("Cars currently detected", len(dets))
+        # Update UI throttled
+        if preview_every_n <= 1 or (fidx % preview_every_n == 0):
+            live_img_slot.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
+
+            now = time.time()
+            dt = max(1e-6, now - last_ui_time)
+            fps_ui = (fidx - last_ui_frame) / dt
+            last_ui_time = now
+            last_ui_frame = fidx
+
+            live_metrics_slot.metric("Forward crossings", flow_count)
+            live_metrics_slot.caption("Cars only • Green = counted")
+            a,b = live_metrics_slot.columns(2)
+            a.metric("Cars in frame", cars_in_frame)
+            b.metric("Counted visible", counted_total)
+            live_metrics_slot.metric("Processing FPS (approx)", f"{fps_ui:.1f}")
+
+            # progress (best-effort)
+            if total_frames > 0:
+                progress_bar.progress(min(1.0, fidx / total_frames))
 
         fidx += 1
 
@@ -302,18 +339,17 @@ def analyze(
     writer.release()
 
     elapsed = time.time() - t0
-
     df = pd.DataFrame(rows)
-    csv_path = os.path.join(outdir, "cars_tracks.csv")
+    csv_path = os.path.join(outdir, "car_tracks.csv")
     df.to_csv(csv_path, index=False)
 
     summary = {
-        "forward_car_crossings": int(flow_count),
+        "forward_crossings": int(flow_count),
         "processed_frames": int(fidx),
         "elapsed_s": float(elapsed),
         "line_orientation": line_orientation,
         "line_pos_frac": float(line_pos_frac),
-        "forward_direction": forward_direction
+        "forward_direction": forward_direction,
     }
     json_path = os.path.join(outdir, "summary.json")
     with open(json_path, "w") as f:
@@ -322,75 +358,112 @@ def analyze(
     return annotated, csv_path, json_path, df, summary
 
 
-# --------------------------- Streamlit UI (Smarter Layout) ---------------------------
+# ------------------------- UI (Presentable Template) -------------------------
 
-st.set_page_config(page_title="Cars Forward Count", layout="wide")
+st.set_page_config(page_title="Forward Car Counter", layout="wide")
 
 st.markdown("""
 <style>
-.kpi {padding: 14px 16px; border-radius: 16px; background: #0b1220; border: 1px solid rgba(255,255,255,0.08);}
-.kpi h3 {margin: 0; font-size: 14px; opacity: 0.85;}
-.kpi p {margin: 6px 0 0 0; font-size: 26px; font-weight: 700;}
-.muted {opacity: 0.75;}
+/* Header */
+.hero {
+  padding: 18px 20px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(13,20,40,0.92), rgba(10,14,22,0.92));
+  border: 1px solid rgba(255,255,255,0.08);
+}
+.hero-title {font-size: 28px; font-weight: 800; margin: 0;}
+.hero-sub {opacity: 0.82; margin-top: 6px;}
+/* Cards */
+.card {
+  padding: 14px 16px;
+  border-radius: 16px;
+  background: rgba(15,23,42,0.65);
+  border: 1px solid rgba(255,255,255,0.08);
+}
+.card h3 {margin: 0; font-size: 13px; opacity: 0.85;}
+.card p {margin: 6px 0 0 0; font-size: 26px; font-weight: 800;}
+.small {opacity: 0.78; font-size: 12px;}
+hr {opacity: 0.2;}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🚗 Car Line-Cross Counter (Forward Only)")
-st.write("Only **cars** are detected. When a car crosses the line in the **forward direction**, it is counted and its box turns **GREEN**.")
+st.markdown("""
+<div class="hero">
+  <div class="hero-title">🚗 Forward Car Counter</div>
+  <div class="hero-sub">
+    Presentable prototype: <b>cars only</b>, counts when crossing a line in the <b>forward direction</b>,
+    and boxes turn <b style="color:#22c55e;">GREEN</b> after crossing.
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-with st.sidebar:
-    st.header("Settings")
+st.write("")
+
+# Layout: Controls | Live | Metrics
+controls, live, metrics = st.columns([1.05, 2.2, 1.0])
+
+with controls:
+    st.markdown('<div class="card"><h3>1) Upload</h3></div>', unsafe_allow_html=True)
+    uploaded = st.file_uploader("Video file", type=["mp4","mov","avi","mkv"], label_visibility="collapsed")
+
+    st.write("")
+    st.markdown('<div class="card"><h3>2) Detection Settings</h3></div>', unsafe_allow_html=True)
     model_name = st.selectbox("Model", ["yolov8n.pt", "yolov8s.pt"], index=0)
     conf = st.slider("Confidence", 0.05, 0.80, 0.20, 0.05)
     iou = st.slider("IoU", 0.10, 0.90, 0.50, 0.05)
     imgsz = st.select_slider("Image size", [640, 768, 896, 960], value=768)
 
-    st.divider()
-    st.subheader("Counting line")
+    st.write("")
+    st.markdown('<div class="card"><h3>3) Count Line</h3><div class="small">Choose where cars cross clearly.</div></div>', unsafe_allow_html=True)
     line_orientation = st.selectbox("Orientation", ["Horizontal", "Vertical"], index=0)
-    line_pos_frac = st.slider("Line position (0=top/left, 1=bottom/right)", 0.1, 0.9, 0.55, 0.01)
+    line_pos_frac = st.slider("Position", 0.10, 0.90, 0.55, 0.01)
 
     if line_orientation == "Horizontal":
         forward_direction = st.selectbox("Forward direction", ["Down", "Up"], index=0)
     else:
         forward_direction = st.selectbox("Forward direction", ["Right", "Left"], index=0)
 
-    st.divider()
-    st.subheader("Performance")
+    st.write("")
+    st.markdown('<div class="card"><h3>4) Performance</h3></div>', unsafe_allow_html=True)
     downscale = st.selectbox("Downscale", [1.0, 0.75, 0.5], index=1)
     preview_every_n = st.selectbox("Preview every N frames", [1,2,3,5,10], index=2)
     max_frames = st.number_input("Max frames (0=all)", min_value=0, value=300, step=100)
 
-    st.divider()
-    st.subheader("Tracker")
+    st.write("")
+    st.markdown('<div class="card"><h3>5) Tracker</h3></div>', unsafe_allow_html=True)
     max_age = st.slider("Track timeout (frames)", 5, 60, 20, 5)
 
-uploaded = st.file_uploader("Drop your video", type=["mp4","mov","avi","mkv"])
-run = st.button("Run", type="primary", disabled=(uploaded is None))
+    run = st.button("▶ Run analysis", type="primary", disabled=(uploaded is None), use_container_width=True)
 
-tab1, tab2 = st.tabs(["📊 Dashboard", "⬇️ Downloads"])
+with live:
+    st.markdown('<div class="card"><h3>Live Preview</h3><div class="small">Yellow = not counted • Green = counted</div></div>', unsafe_allow_html=True)
+    live_img_slot = st.empty()
+    st.write("")
+    progress_bar = st.progress(0.0)
 
-with tab1:
-    k1, k2, k3, k4 = st.columns(4)
-    kpiA, kpiB, kpiC, kpiD = k1.empty(), k2.empty(), k3.empty(), k4.empty()
+with metrics:
+    st.markdown('<div class="card"><h3>Live Metrics</h3><div class="small">Forward-only crossings</div></div>', unsafe_allow_html=True)
+    live_metrics_slot = st.container()
+    st.write("")
+    st.markdown('<div class="card"><h3>Outputs</h3><div class="small">Video + CSV + JSON</div></div>', unsafe_allow_html=True)
+    outputs_slot = st.container()
 
-    st.divider()
-    left, right = st.columns([2,1])
-    live_img = left.empty()
-    live_panel = right.empty()
+st.write("")
+st.markdown("—")
 
-    st.divider()
-    final = st.container()
+# Results section
+st.markdown("## Results")
+results_area = st.container()
 
-    if run and uploaded is not None:
-        workdir = tempfile.mkdtemp(prefix="car_forward_")
-        in_path = os.path.join(workdir, uploaded.name)
-        with open(in_path, "wb") as f:
-            f.write(uploaded.getbuffer())
+if run and uploaded is not None:
+    workdir = tempfile.mkdtemp(prefix="car_presentable_")
+    in_path = os.path.join(workdir, uploaded.name)
+    with open(in_path, "wb") as f:
+        f.write(uploaded.getbuffer())
 
-        tracker_cfg = {"max_age": int(max_age), "iou_thr": 0.25, "max_dist_px": 80.0}
+    tracker_cfg = {"max_age": int(max_age), "iou_thr": 0.25, "max_dist_px": 80.0}
 
-        st.success("Processing… cars only. Green boxes mean counted.")
+    with st.spinner("Running…"):
         annotated, csv_path, json_path, df, summary = analyze(
             video_path=in_path,
             outdir=workdir,
@@ -405,33 +478,46 @@ with tab1:
             line_pos_frac=float(line_pos_frac),
             forward_direction=forward_direction,
             tracker_cfg=tracker_cfg,
-            live_img=live_img,
-            live_panel=live_panel
+            live_img_slot=live_img_slot,
+            live_metrics_slot=live_metrics_slot,
+            progress_bar=progress_bar
         )
 
-        kpiA.markdown(f"<div class='kpi'><h3>Forward crossings</h3><p>{summary['forward_car_crossings']}</p></div>", unsafe_allow_html=True)
-        kpiB.markdown(f"<div class='kpi'><h3>Frames</h3><p>{summary['processed_frames']}</p></div>", unsafe_allow_html=True)
-        kpiC.markdown(f"<div class='kpi'><h3>Elapsed (s)</h3><p>{summary['elapsed_s']:.1f}</p></div>", unsafe_allow_html=True)
-        kpiD.markdown(f"<div class='kpi'><h3>Line</h3><p>{summary['line_orientation']} {summary['forward_direction']}</p></div>", unsafe_allow_html=True)
+    # Presentable result cards
+    with results_area:
+        r1, r2, r3, r4 = st.columns(4)
+        r1.markdown(f"<div class='card'><h3>Forward crossings</h3><p>{summary['forward_crossings']}</p></div>", unsafe_allow_html=True)
+        r2.markdown(f"<div class='card'><h3>Frames processed</h3><p>{summary['processed_frames']}</p></div>", unsafe_allow_html=True)
+        r3.markdown(f"<div class='card'><h3>Elapsed (s)</h3><p>{summary['elapsed_s']:.1f}</p></div>", unsafe_allow_html=True)
+        r4.markdown(f"<div class='card'><h3>Line</h3><p>{summary['line_orientation']} • {summary['forward_direction']}</p></div>", unsafe_allow_html=True)
 
-        with final:
-            st.subheader("Final annotated video")
-            st.video(annotated)
-            st.subheader("Sample rows")
+        st.write("")
+        st.markdown("### Final Annotated Video")
+        st.video(annotated)
+
+        st.write("")
+        st.markdown("### Download Package")
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            with open(annotated, "rb") as f:
+                st.download_button("Download annotated_output.mp4", f, file_name="annotated_output.mp4", use_container_width=True)
+        with d2:
+            with open(csv_path, "rb") as f:
+                st.download_button("Download car_tracks.csv", f, file_name="car_tracks.csv", use_container_width=True)
+        with d3:
+            with open(json_path, "rb") as f:
+                st.download_button("Download summary.json", f, file_name="summary.json", use_container_width=True)
+
+        st.write("")
+        with st.expander("Show sample data (first 200 rows)"):
             st.dataframe(df.head(200), use_container_width=True)
 
-            st.session_state["out_annotated"] = annotated
-            st.session_state["out_csv"] = csv_path
-            st.session_state["out_json"] = json_path
+    # Put quick links in Outputs card
+    with outputs_slot:
+        st.success("Outputs ready ✅")
+        st.write(f"**Forward crossings:** {summary['forward_crossings']}")
+        st.write("Use the download buttons in Results.")
 
-with tab2:
-    st.subheader("Downloads")
-    if "out_annotated" in st.session_state:
-        with open(st.session_state["out_annotated"], "rb") as f:
-            st.download_button("Download annotated_output.mp4", f, file_name="annotated_output.mp4")
-        with open(st.session_state["out_csv"], "rb") as f:
-            st.download_button("Download cars_tracks.csv", f, file_name="cars_tracks.csv")
-        with open(st.session_state["out_json"], "rb") as f:
-            st.download_button("Download summary.json", f, file_name="summary.json")
-    else:
-        st.info("Run the analysis first.")
+else:
+    with results_area:
+        st.info("Upload a video, pick line settings, then click **Run analysis**. Green boxes mean the car has been counted.")
