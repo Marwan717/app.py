@@ -1,0 +1,6 @@
+# app.py
+streamlit
+ultralytics
+opencv-python-headless
+numpy
+pandas
