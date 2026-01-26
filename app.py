@@ -1,5 +1,5 @@
-# app.py — Presentable Dashboard + Calibrated MPH + Concise Outputs
-# Cars only • forward line crossing • box turns GREEN after crossing
+# app.py — SIMPLE Layout + Calibrated MPH + Concise Outputs
+# Cars only • forward line crossing • GREEN after crossing
 #
 # requirements.txt:
 # streamlit
@@ -19,10 +19,9 @@ from ultralytics import YOLO
 
 CAR_CLASS_ID = 2  # COCO car
 
-# OpenCV BGR colors
-YELLOW = (0, 255, 255)  # pending
-GREEN  = (0, 255, 0)    # counted
-CYAN   = (255, 255, 0)  # line
+YELLOW = (0, 255, 255)
+GREEN  = (0, 255, 0)
+CYAN   = (255, 255, 0)
 WHITE  = (255, 255, 255)
 
 # ------------------------- Utils -------------------------
@@ -55,8 +54,7 @@ def side_of_line(px, py, x1, y1, x2, y2):
 def build_homography(px_points, rect_width_m, rect_length_m):
     """
     px_points: 4 points clockwise around a road rectangle.
-    Maps image pixels -> ground plane meters rectangle:
-      (0,0), (W,0), (W,L), (0,L)
+    Maps pixels -> meters rectangle: (0,0), (W,0), (W,L), (0,L)
     """
     src = np.array(px_points, dtype=np.float32)
     dst = np.array([[0, 0], [rect_width_m, 0], [rect_width_m, rect_length_m], [0, rect_length_m]], dtype=np.float32)
@@ -67,14 +65,14 @@ def project_point(H, cx, cy):
     gp = cv2.perspectiveTransform(pt, H)[0][0]
     return float(gp[0]), float(gp[1])
 
-# ------------------------- Tracker (with calibrated mph) -------------------------
+# ------------------------- Tracker (with mph) -------------------------
 
 class CarTracker:
     """
-    Lightweight tracker (no lap/bytetrack):
+    Lightweight tracker:
     - Greedy IoU then centroid distance
-    - Keeps 'crossed' so boxes stay green
-    - If calibrated (H != None), computes smoothed mph
+    - Keeps 'crossed' state so boxes stay green after counting
+    - If H provided, computes smoothed mph from projected ground-plane motion
     """
     def __init__(self, fps, H=None, speed_window=12, max_age=20, iou_thr=0.25, max_dist_px=80.0, mph_clip=120.0):
         self.fps = float(fps)
@@ -110,9 +108,7 @@ class CarTracker:
         return tid
 
     def _compute_mph(self, tr):
-        if self.H is None:
-            return None
-        if len(tr["hist_m"]) < 2:
+        if self.H is None or len(tr["hist_m"]) < 2:
             return None
         hist = list(tr["hist_m"])[-self.speed_window:]
         if len(hist) < 2:
@@ -208,7 +204,7 @@ class CarTracker:
 
         return dets
 
-# ------------------------- Core Analysis -------------------------
+# ------------------------- Analysis -------------------------
 
 def analyze(
     video_path, outdir,
@@ -217,7 +213,7 @@ def analyze(
     line_orientation, line_pos_frac, forward_direction,
     H, speed_window,
     tracker_cfg,
-    live_img_slot, live_metrics_slot, progress_bar
+    live_img_slot, metrics_slots, progress_bar
 ):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -235,7 +231,6 @@ def analyze(
         downscale = 1.0
 
     model = YOLO(model_name)
-
     annotated = os.path.join(outdir, "annotated_output.mp4")
     writer = make_writer(annotated, fps, w, h)
 
@@ -249,7 +244,7 @@ def analyze(
         mph_clip=tracker_cfg["mph_clip"],
     )
 
-    # define count line
+    # count line geometry
     if line_orientation == "Horizontal":
         y_line = int(line_pos_frac * h)
         x1, y1, x2, y2 = 0, y_line, w - 1, y_line
@@ -260,9 +255,8 @@ def analyze(
         y_line = None
 
     forward_count = 0
-    events = []  # concise
-
-    mph_recent = deque(maxlen=500)  # for status summary
+    events = []
+    mph_recent = deque(maxlen=500)
 
     t0 = time.time()
     fidx = 0
@@ -286,7 +280,6 @@ def analyze(
             xyxy = res.boxes.xyxy.cpu().numpy()
             cls = res.boxes.cls.cpu().numpy().astype(int)
             confs = res.boxes.conf.cpu().numpy()
-
             for bb, c, cf in zip(xyxy, cls, confs):
                 if c != CAR_CLASS_ID:
                     continue
@@ -301,10 +294,8 @@ def analyze(
 
         dets = tracker.update(dets, fidx)
 
-        # draw count line
+        # draw line
         cv2.line(frame, (x1, y1), (x2, y2), CYAN, 3)
-        cv2.putText(frame, f"COUNT LINE • Forward: {forward_direction}", (12, 34),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, CYAN, 2)
 
         cars_in_frame = 0
         counted_visible = 0
@@ -316,7 +307,6 @@ def analyze(
             if tr is None:
                 continue
 
-            # speed stats
             if tr["mph"] is not None:
                 mph_recent.append(float(tr["mph"]))
 
@@ -338,7 +328,6 @@ def analyze(
                     tr["crossed"] = True
                     forward_count += 1
                     crossed_this_frame = True
-
                     events.append({
                         "time_s": round(fidx / float(fps), 3),
                         "car_id": tid,
@@ -350,26 +339,24 @@ def analyze(
             if tr["crossed"]:
                 counted_visible += 1
 
-            # draw bbox + label with mph
             x1b, y1b, x2b, y2b = map(int, tr["bbox"].tolist())
             cv2.rectangle(frame, (x1b, y1b), (x2b, y2b), color, 3)
 
-            mph_txt = f"{tr['mph']:.1f} mph" if tr["mph"] is not None else ("mph: —" if H is not None else "mph: (calibrate)")
-            label = f"CAR #{tid} • {mph_txt}" + (" • COUNTED" if tr["crossed"] else "")
-            cv2.putText(frame, label, (x1b, max(24, y1b - 8)),
+            mph_txt = f"{tr['mph']:.1f} mph" if tr["mph"] is not None else ("— mph" if H is not None else "calibrate")
+            cv2.putText(frame, f"CAR {tid} • {mph_txt}", (x1b, max(24, y1b - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2)
 
             if crossed_this_frame:
                 cv2.putText(frame, "+1", (x2b + 6, y1b + 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, GREEN, 3)
 
-        # bottom HUD
-        cv2.putText(frame, f"FORWARD CAR COUNT: {forward_count}", (12, h - 18),
+        # HUD
+        cv2.putText(frame, f"COUNT: {forward_count}", (12, h - 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.95, WHITE, 2)
 
         writer.write(frame)
 
-        # UI update
+        # UI
         if preview_every_n <= 1 or (fidx % preview_every_n == 0):
             live_img_slot.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_container_width=True)
 
@@ -379,7 +366,6 @@ def analyze(
             last_ui_time = now
             last_ui_frame = fidx
 
-            # mph summary
             if len(mph_recent) >= 8:
                 s = np.array(mph_recent, dtype=float)
                 mph_med = float(np.median(s))
@@ -388,18 +374,11 @@ def analyze(
                 mph_med = None
                 mph_p90 = None
 
-            live_metrics_slot.metric("Forward crossings", forward_count)
-            live_metrics_slot.caption("Cars only • Green = counted")
-
-            a, b = live_metrics_slot.columns(2)
-            a.metric("Cars in frame", cars_in_frame)
-            b.metric("Counted visible", counted_visible)
-
-            c, dcol = live_metrics_slot.columns(2)
-            c.metric("Median mph", f"{mph_med:.1f}" if mph_med is not None else "—")
-            dcol.metric("p90 mph", f"{mph_p90:.1f}" if mph_p90 is not None else "—")
-
-            live_metrics_slot.metric("Processing FPS (approx)", f"{fps_ui:.1f}")
+            m_count, m_cars, m_med, m_fps = metrics_slots
+            m_count.metric("Forward crossings", forward_count)
+            m_cars.metric("Cars in frame", cars_in_frame)
+            m_med.metric("Median mph", f"{mph_med:.1f}" if mph_med is not None else "—")
+            m_fps.metric("Proc FPS", f"{fps_ui:.1f}")
 
             if total_frames > 0:
                 progress_bar.progress(min(1.0, fidx / total_frames))
@@ -410,8 +389,6 @@ def analyze(
     writer.release()
 
     elapsed = time.time() - t0
-
-    # concise outputs
     events_df = pd.DataFrame(events)
     crossings_csv = os.path.join(outdir, "crossings.csv")
     events_df.to_csv(crossings_csv, index=False)
@@ -428,9 +405,6 @@ def analyze(
         "events_rows": int(len(events)),
         "processed_frames": int(fidx),
         "elapsed_s": float(elapsed),
-        "line_orientation": line_orientation,
-        "line_pos_frac": float(line_pos_frac),
-        "forward_direction": forward_direction,
         "speed_calibrated": bool(H is not None),
         "speed_window_frames": int(speed_window),
         "speed_summary": speed_summary,
@@ -441,124 +415,64 @@ def analyze(
 
     return annotated, crossings_csv, summary_json, events_df, summary
 
-# ------------------------- UI (Layout you wanted) -------------------------
+# ------------------------- SIMPLE UI -------------------------
 
-st.set_page_config(page_title="Forward Car Counter", layout="wide")
+st.title("Forward Car Counter")
 
-st.markdown("""
-<style>
-.hero {
-  padding: 18px 20px;
-  border-radius: 18px;
-  background: linear-gradient(135deg, rgba(13,20,40,0.92), rgba(10,14,22,0.92));
-  border: 1px solid rgba(255,255,255,0.08);
-}
-.hero-title {font-size: 28px; font-weight: 800; margin: 0;}
-.hero-sub {opacity: 0.82; margin-top: 6px;}
-.card {
-  padding: 14px 16px;
-  border-radius: 16px;
-  background: rgba(15,23,42,0.65);
-  border: 1px solid rgba(255,255,255,0.08);
-}
-.card h3 {margin: 0; font-size: 13px; opacity: 0.85;}
-.card p {margin: 6px 0 0 0; font-size: 26px; font-weight: 800;}
-.small {opacity: 0.78; font-size: 12px;}
-hr {opacity: 0.2;}
-</style>
-""", unsafe_allow_html=True)
+uploaded = st.file_uploader("Upload a video", type=["mp4", "mov", "avi", "mkv"])
 
-st.markdown("""
-<div class="hero">
-  <div class="hero-title">🚗 Forward Car Counter</div>
-  <div class="hero-sub">
-    Cars only • forward line crossing • boxes turn <b style="color:#22c55e;">GREEN</b> after crossing • optional calibrated mph.
-  </div>
-</div>
-""", unsafe_allow_html=True)
+with st.sidebar:
+    st.header("Settings")
 
-st.write("")
-
-# Layout: Controls | Live | Metrics
-controls, live, metrics = st.columns([1.05, 2.2, 1.0])
-
-with controls:
-    st.markdown('<div class="card"><h3>1) Upload</h3></div>', unsafe_allow_html=True)
-    uploaded = st.file_uploader("Video file", type=["mp4","mov","avi","mkv"], label_visibility="collapsed")
-
-    st.write("")
-    st.markdown('<div class="card"><h3>2) Detection Settings</h3></div>', unsafe_allow_html=True)
+    st.subheader("Detection")
     model_name = st.selectbox("Model", ["yolov8n.pt", "yolov8s.pt"], index=0)
     conf = st.slider("Confidence", 0.05, 0.80, 0.20, 0.05)
     iou = st.slider("IoU", 0.10, 0.90, 0.50, 0.05)
     imgsz = st.select_slider("Image size", [640, 768, 896, 960], value=768)
 
-    st.write("")
-    st.markdown('<div class="card"><h3>3) Count Line</h3><div class="small">Choose where cars cross clearly.</div></div>', unsafe_allow_html=True)
+    st.subheader("Count line")
     line_orientation = st.selectbox("Orientation", ["Horizontal", "Vertical"], index=0)
     line_pos_frac = st.slider("Position", 0.10, 0.90, 0.55, 0.01)
-    if line_orientation == "Horizontal":
-        forward_direction = st.selectbox("Forward direction", ["Down", "Up"], index=0)
-    else:
-        forward_direction = st.selectbox("Forward direction", ["Right", "Left"], index=0)
+    forward_direction = st.selectbox("Forward direction", ["Down", "Up"], index=0) if line_orientation == "Horizontal" \
+                        else st.selectbox("Forward direction", ["Right", "Left"], index=0)
 
-    st.write("")
-    st.markdown('<div class="card"><h3>4) Speed Calibration (mph)</h3><div class="small">Use a road rectangle (4 points, clockwise).</div></div>', unsafe_allow_html=True)
+    st.subheader("Speed (mph)")
     use_calib = st.checkbox("Enable calibrated mph", value=True)
-    rect_w = st.number_input("Rectangle width (m)", min_value=0.1, value=3.7, step=0.1, disabled=not use_calib)
-    rect_l = st.number_input("Rectangle length (m)", min_value=0.1, value=10.0, step=0.5, disabled=not use_calib)
+    rect_w = st.number_input("Road rectangle width (m)", min_value=0.1, value=3.7, step=0.1, disabled=not use_calib)
+    rect_l = st.number_input("Road rectangle length (m)", min_value=0.1, value=10.0, step=0.5, disabled=not use_calib)
 
-    # Points are in ORIGINAL frame coordinates; we convert internally for downscale.
-    p1x = st.number_input("P1 x (top-left)", min_value=0, value=100, disabled=not use_calib)
-    p1y = st.number_input("P1 y", min_value=0, value=100, disabled=not use_calib)
-    p2x = st.number_input("P2 x (top-right)", min_value=0, value=300, disabled=not use_calib)
-    p2y = st.number_input("P2 y", min_value=0, value=100, disabled=not use_calib)
-    p3x = st.number_input("P3 x (bottom-right)", min_value=0, value=300, disabled=not use_calib)
-    p3y = st.number_input("P3 y", min_value=0, value=300, disabled=not use_calib)
-    p4x = st.number_input("P4 x (bottom-left)", min_value=0, value=100, disabled=not use_calib)
-    p4y = st.number_input("P4 y", min_value=0, value=300, disabled=not use_calib)
+    st.caption("4 points clockwise: top-left, top-right, bottom-right, bottom-left (in original video pixels)")
+    p1x = st.number_input("P1 x", min_value=0, value=100, disabled=not use_calib); p1y = st.number_input("P1 y", min_value=0, value=100, disabled=not use_calib)
+    p2x = st.number_input("P2 x", min_value=0, value=300, disabled=not use_calib); p2y = st.number_input("P2 y", min_value=0, value=100, disabled=not use_calib)
+    p3x = st.number_input("P3 x", min_value=0, value=300, disabled=not use_calib); p3y = st.number_input("P3 y", min_value=0, value=300, disabled=not use_calib)
+    p4x = st.number_input("P4 x", min_value=0, value=100, disabled=not use_calib); p4y = st.number_input("P4 y", min_value=0, value=300, disabled=not use_calib)
 
     speed_window = st.slider("Speed smoothing (frames)", 5, 45, 12, 5, disabled=not use_calib)
 
-    st.write("")
-    st.markdown('<div class="card"><h3>5) Performance</h3></div>', unsafe_allow_html=True)
+    st.subheader("Performance")
     downscale = st.selectbox("Downscale", [1.0, 0.75, 0.5], index=1)
-    preview_every_n = st.selectbox("Preview every N frames", [1,2,3,5,10], index=2)
+    preview_every_n = st.selectbox("Preview every N frames", [1, 2, 3, 5, 10], index=2)
     max_frames = st.number_input("Max frames (0=all)", min_value=0, value=300, step=100)
-
-    st.write("")
-    st.markdown('<div class="card"><h3>6) Tracker</h3></div>', unsafe_allow_html=True)
     max_age = st.slider("Track timeout (frames)", 5, 60, 20, 5)
 
-    run = st.button("▶ Run analysis", type="primary", disabled=(uploaded is None), use_container_width=True)
+run = st.button("Run analysis", type="primary", disabled=(uploaded is None))
 
-with live:
-    st.markdown('<div class="card"><h3>Live Preview</h3><div class="small">Yellow = not counted • Green = counted • mph shown if calibrated</div></div>', unsafe_allow_html=True)
-    live_img_slot = st.empty()
-    st.write("")
-    progress_bar = st.progress(0.0)
+preview = st.empty()
+progress = st.progress(0.0)
 
-with metrics:
-    st.markdown('<div class="card"><h3>Status</h3><div class="small">Concise metrics</div></div>', unsafe_allow_html=True)
-    live_metrics_slot = st.container()
-    st.write("")
-    st.markdown('<div class="card"><h3>Outputs</h3><div class="small">Video + crossings.csv + summary.json</div></div>', unsafe_allow_html=True)
-    outputs_slot = st.container()
-
-st.write("")
-st.markdown("—")
-
-# Results section
-st.markdown("## Results")
-results_area = st.container()
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Forward crossings", "—")
+m2.metric("Cars in frame", "—")
+m3.metric("Median mph", "—")
+m4.metric("Proc FPS", "—")
 
 if run and uploaded is not None:
-    workdir = tempfile.mkdtemp(prefix="car_presentable_mph_")
+    workdir = tempfile.mkdtemp(prefix="car_simple_")
     in_path = os.path.join(workdir, uploaded.name)
     with open(in_path, "wb") as f:
         f.write(uploaded.getbuffer())
 
-    # Build homography after downscale: convert point coords to resized frame coords.
+    # Build homography after downscale (convert points to resized coords)
     H = None
     if use_calib:
         px_points = [
@@ -571,7 +485,7 @@ if run and uploaded is not None:
 
     tracker_cfg = {"max_age": int(max_age), "iou_thr": 0.25, "max_dist_px": 80.0, "mph_clip": 120.0}
 
-    with st.spinner("Running…"):
+    with st.spinner("Running..."):
         annotated, crossings_csv, summary_json, events_df, summary = analyze(
             video_path=in_path,
             outdir=workdir,
@@ -588,43 +502,27 @@ if run and uploaded is not None:
             H=H,
             speed_window=int(speed_window) if use_calib else 12,
             tracker_cfg=tracker_cfg,
-            live_img_slot=live_img_slot,
-            live_metrics_slot=live_metrics_slot,
-            progress_bar=progress_bar
+            live_img_slot=preview,
+            metrics_slots=(m1, m2, m3, m4),
+            progress_bar=progress
         )
 
-    with results_area:
-        r1, r2, r3, r4 = st.columns(4)
-        r1.markdown(f"<div class='card'><h3>Forward crossings</h3><p>{summary['forward_crossings']}</p></div>", unsafe_allow_html=True)
-        r2.markdown(f"<div class='card'><h3>Events logged</h3><p>{summary['events_rows']}</p></div>", unsafe_allow_html=True)
-        r3.markdown(f"<div class='card'><h3>Elapsed (s)</h3><p>{summary['elapsed_s']:.1f}</p></div>", unsafe_allow_html=True)
-        r4.markdown(f"<div class='card'><h3>Speed</h3><p>{'Calibrated' if summary['speed_calibrated'] else 'Off'}</p></div>", unsafe_allow_html=True)
+    st.success("Done ✅")
 
-        st.write("")
-        st.markdown("### Final Annotated Video")
-        st.video(annotated)
+    st.subheader("Final annotated video")
+    st.video(annotated)
 
-        st.write("")
-        st.markdown("### Crossing Events (concise)")
-        st.dataframe(events_df.tail(40), use_container_width=True, height=260)
+    st.subheader("Downloads")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        with open(annotated, "rb") as f:
+            st.download_button("annotated_output.mp4", f, file_name="annotated_output.mp4", use_container_width=True)
+    with c2:
+        with open(crossings_csv, "rb") as f:
+            st.download_button("crossings.csv", f, file_name="crossings.csv", use_container_width=True)
+    with c3:
+        with open(summary_json, "rb") as f:
+            st.download_button("summary.json", f, file_name="summary.json", use_container_width=True)
 
-        st.write("")
-        st.markdown("### Download Package")
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            with open(annotated, "rb") as f:
-                st.download_button("Download annotated_output.mp4", f, file_name="annotated_output.mp4", use_container_width=True)
-        with d2:
-            with open(crossings_csv, "rb") as f:
-                st.download_button("Download crossings.csv", f, file_name="crossings.csv", use_container_width=True)
-        with d3:
-            with open(summary_json, "rb") as f:
-                st.download_button("Download summary.json", f, file_name="summary.json", use_container_width=True)
-
-    with outputs_slot:
-        st.success("Outputs ready ✅")
-        st.write(f"**Forward crossings:** {summary['forward_crossings']}")
-        st.write("Download from Results.")
-else:
-    with results_area:
-        st.info("Upload a video → set line + (optional) calibration → Run. mph is accurate only when calibrated.")
+    st.subheader("Crossing events (last 40)")
+    st.dataframe(events_df.tail(40), use_container_width=True, height=260)
