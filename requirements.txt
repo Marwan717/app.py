@@ -4,8 +4,3 @@ ultralytics
 opencv-python-headless==4.10.0.84
 numpy
 pandas
-
-import sys
-import streamlit as st
-st.write(sys.version)
-
