@@ -417,7 +417,7 @@ def analyze(
 
 # ------------------------- SIMPLE UI -------------------------
 
-st.title("Forward Car Counter")
+st.title("")
 
 uploaded = st.file_uploader("Upload a video", type=["mp4", "mov", "avi", "mkv"])
 
