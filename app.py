@@ -16,6 +16,7 @@ from ultralytics import YOLO
 CAR_CLASS_ID = 2
 NEAR_MISS_THRESHOLD_S = 4.0
 MAX_TRACK_AGE = 20
+FPS_FALLBACK = 30.0
 
 # =========================
 # UTILS
@@ -28,28 +29,12 @@ def make_writer(path, fps, w, h):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     return cv2.VideoWriter(path, fourcc, fps, (w, h))
 
-def build_homography(px_pts, width_m, length_m):
-    src = np.array(px_pts, dtype=np.float32)
-    dst = np.array([
-        [0, 0],
-        [width_m, 0],
-        [width_m, length_m],
-        [0, length_m]
-    ], dtype=np.float32)
-    return cv2.getPerspectiveTransform(src, dst)
-
-def project_point(H, x, y):
-    pt = np.array([[[x, y]]], dtype=np.float32)
-    out = cv2.perspectiveTransform(pt, H)[0][0]
-    return float(out[0]), float(out[1])
-
 # =========================
 # TRACKER
 # =========================
 class Tracker:
-    def __init__(self, fps, H=None):
+    def __init__(self, fps):
         self.fps = fps
-        self.H = H
         self.tracks = {}
         self.next_id = 1
 
@@ -57,8 +42,8 @@ class Tracker:
         updated = {}
 
         for det in detections:
-            matched_id = None
             cx, cy = det["cx"], det["cy"]
+            matched_id = None
 
             for tid, tr in self.tracks.items():
                 dist = np.hypot(cx - tr["cx"], cy - tr["cy"])
@@ -85,9 +70,7 @@ class Tracker:
                 updated[matched_id] = tr
 
             tr = updated[matched_id]
-            if self.H is not None:
-                gx, gy = project_point(self.H, cx, cy)
-                tr["hist"].append((frame_idx, gx, gy))
+            tr["hist"].append((frame_idx, cx, cy))
 
         self.tracks = {
             tid: tr for tid, tr in updated.items()
@@ -103,6 +86,7 @@ class NearMissDetector:
     def __init__(self, zone):
         self.zone = zone
         self.events = []
+        self.logged_pairs = set()
 
     def in_zone(self, x, y):
         return (
@@ -110,7 +94,7 @@ class NearMissDetector:
             and self.zone["ymin"] <= y <= self.zone["ymax"]
         )
 
-    def check(self, tracks, t_s):
+    def check(self, tracks, t_s, fps):
         active = []
 
         for tr in tracks.values():
@@ -121,46 +105,39 @@ class NearMissDetector:
                 active.append(tr)
 
         for a, b in combinations(active, 2):
-            ta = a["hist"][-1][0]
-            tb = b["hist"][-1][0]
-            pet = abs(ta - tb) / 30.0
+            pair_id = tuple(sorted([a["id"], b["id"]]))
+            if pair_id in self.logged_pairs:
+                continue
+
+            fa = a["hist"][-1][0]
+            fb = b["hist"][-1][0]
+            pet = abs(fa - fb) / fps
 
             if pet <= NEAR_MISS_THRESHOLD_S:
+                self.logged_pairs.add(pair_id)
                 self.events.append({
                     "time_s": round(t_s, 2),
-                    "car_1": a["id"],
-                    "car_2": b["id"],
-                    "pet_s": round(pet, 2)
+                    "car_1_id": a["id"],
+                    "car_2_id": b["id"],
+                    "pet_s": round(pet, 2),
+                    "type": "near_miss"
                 })
 
 # =========================
 # STREAMLIT UI
 # =========================
-st.title("Vehicle Safety Event Detection")
+st.set_page_config(layout="wide")
+st.title("Vehicle Near-Miss Detection")
 
-uploaded = st.file_uploader("Upload video", type=["mp4", "mov"])
+uploaded = st.file_uploader("Upload traffic video", type=["mp4", "mov", "avi"])
 
-model = YOLO("yolov8n.pt")
+st.subheader("Conflict Zone (pixels)")
+zx1 = st.number_input("xmin", 0)
+zx2 = st.number_input("xmax", 300)
+zy1 = st.number_input("ymin", 0)
+zy2 = st.number_input("ymax", 300)
 
-use_calib = st.checkbox("Enable speed calibration", True)
-
-if use_calib:
-    st.subheader("Homography")
-    rect_w = st.number_input("Width meters", 3.7)
-    rect_l = st.number_input("Length meters", 10.0)
-    pts = []
-    for i in range(4):
-        x = st.number_input(f"P{i+1} x", 0)
-        y = st.number_input(f"P{i+1} y", 0)
-        pts.append((x, y))
-
-st.subheader("Conflict Zone meters")
-zx1 = st.number_input("xmin", 2.0)
-zx2 = st.number_input("xmax", 6.0)
-zy1 = st.number_input("ymin", 4.0)
-zy2 = st.number_input("ymax", 8.0)
-
-run = st.button("Run")
+run = st.button("Run Analysis", type="primary")
 
 # =========================
 # MAIN
@@ -172,18 +149,19 @@ if run and uploaded:
         f.write(uploaded.getbuffer())
 
     cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps < 1:
+        fps = FPS_FALLBACK
+
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     out_path = os.path.join(tmp, "annotated.mp4")
     writer = make_writer(out_path, fps, w, h)
 
-    H = None
-    if use_calib:
-        H = build_homography(pts, rect_w, rect_l)
+    model = YOLO("yolov8n.pt")
+    tracker = Tracker(fps)
 
-    tracker = Tracker(fps, H)
     near_miss = NearMissDetector({
         "xmin": zx1,
         "xmax": zx2,
@@ -199,8 +177,8 @@ if run and uploaded:
             break
 
         res = model.predict(frame, conf=0.25, verbose=False)[0]
-
         dets = []
+
         if res.boxes is not None:
             for bb, cls in zip(
                 res.boxes.xyxy.cpu().numpy(),
@@ -212,13 +190,15 @@ if run and uploaded:
 
         tracks = tracker.update(dets, frame_idx)
         t_s = frame_idx / fps
-        near_miss.check(tracks, t_s)
+        near_miss.check(tracks, t_s, fps)
 
-        # draw zone
-        if H:
-            p1 = (int(zx1 * 50), int(zy1 * 50))
-            p2 = (int(zx2 * 50), int(zy2 * 50))
-            cv2.rectangle(frame, p1, p2, (0, 0, 255), 2)
+        cv2.rectangle(
+            frame,
+            (int(zx1), int(zy1)),
+            (int(zx2), int(zy2)),
+            (0, 0, 255),
+            2,
+        )
 
         for tr in tracks.values():
             x1, y1, x2, y2 = map(int, tr["bbox"])
@@ -226,7 +206,7 @@ if run and uploaded:
             cv2.putText(
                 frame,
                 f"ID {tr['id']}",
-                (x1, y1 - 5),
+                (x1, y1 - 6),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 (255, 255, 255),
@@ -241,10 +221,10 @@ if run and uploaded:
 
     df = pd.DataFrame(near_miss.events)
 
-    st.success("Done")
+    st.success("Analysis complete")
     st.video(out_path)
     st.dataframe(df)
 
     csv_path = os.path.join(tmp, "near_miss_events.csv")
     df.to_csv(csv_path, index=False)
-    st.download_button("Download CSV", open(csv_path, "rb"), "near_miss_events.csv")
+    st.download_button("Download Near-Miss CSV", open(csv_path, "rb"), "near_miss_events.csv")
