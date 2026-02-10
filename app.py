@@ -1,22 +1,27 @@
+import sys
 import os
-import time
 import tempfile
-from itertools import combinations
 from collections import deque
+from itertools import combinations
 
-import cv2
+import streamlit as st
 import numpy as np
 import pandas as pd
-import streamlit as st
+import cv2
 from ultralytics import YOLO
+
+# =========================
+# DEBUG CHECK (remove later)
+# =========================
+st.write("Python version:", sys.version)
 
 # =========================
 # CONFIG
 # =========================
 CAR_CLASS_ID = 2
-NEAR_MISS_THRESHOLD_S = 4.0
+NEAR_MISS_THRESHOLD_SEC = 4.0
 MAX_TRACK_AGE = 20
-FPS_FALLBACK = 30.0
+MATCH_DIST_PX = 60
 
 # =========================
 # UTILS
@@ -47,7 +52,7 @@ class Tracker:
 
             for tid, tr in self.tracks.items():
                 dist = np.hypot(cx - tr["cx"], cy - tr["cy"])
-                if dist < 60:
+                if dist < MATCH_DIST_PX:
                     matched_id = tid
                     break
 
@@ -69,8 +74,7 @@ class Tracker:
                 tr["last_frame"] = frame_idx
                 updated[matched_id] = tr
 
-            tr = updated[matched_id]
-            tr["hist"].append((frame_idx, cx, cy))
+            updated[matched_id]["hist"].append((frame_idx, cx, cy))
 
         self.tracks = {
             tid: tr for tid, tr in updated.items()
@@ -94,7 +98,7 @@ class NearMissDetector:
             and self.zone["ymin"] <= y <= self.zone["ymax"]
         )
 
-    def check(self, tracks, t_s, fps):
+    def check(self, tracks, frame_idx, fps):
         active = []
 
         for tr in tracks.values():
@@ -105,22 +109,22 @@ class NearMissDetector:
                 active.append(tr)
 
         for a, b in combinations(active, 2):
-            pair_id = tuple(sorted([a["id"], b["id"]]))
-            if pair_id in self.logged_pairs:
+            pair = tuple(sorted([a["id"], b["id"]]))
+            if pair in self.logged_pairs:
                 continue
 
             fa = a["hist"][-1][0]
             fb = b["hist"][-1][0]
             pet = abs(fa - fb) / fps
 
-            if pet <= NEAR_MISS_THRESHOLD_S:
-                self.logged_pairs.add(pair_id)
+            if pet <= NEAR_MISS_THRESHOLD_SEC:
+                self.logged_pairs.add(pair)
                 self.events.append({
-                    "time_s": round(t_s, 2),
+                    "time_s": round(frame_idx / fps, 2),
                     "car_1_id": a["id"],
                     "car_2_id": b["id"],
                     "pet_s": round(pet, 2),
-                    "type": "near_miss"
+                    "event": "near_miss"
                 })
 
 # =========================
@@ -145,13 +149,14 @@ run = st.button("Run Analysis", type="primary")
 if run and uploaded:
     tmp = tempfile.mkdtemp()
     video_path = os.path.join(tmp, uploaded.name)
+
     with open(video_path, "wb") as f:
         f.write(uploaded.getbuffer())
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps < 1:
-        fps = FPS_FALLBACK
+        fps = 30.0
 
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -176,22 +181,22 @@ if run and uploaded:
         if not ok:
             break
 
-        res = model.predict(frame, conf=0.25, verbose=False)[0]
-        dets = []
+        result = model.predict(frame, conf=0.25, verbose=False)[0]
+        detections = []
 
-        if res.boxes is not None:
+        if result.boxes is not None:
             for bb, cls in zip(
-                res.boxes.xyxy.cpu().numpy(),
-                res.boxes.cls.cpu().numpy().astype(int),
+                result.boxes.xyxy.cpu().numpy(),
+                result.boxes.cls.cpu().numpy().astype(int),
             ):
                 if cls == CAR_CLASS_ID:
                     cx, cy = bb_centroid(bb)
-                    dets.append({"cx": cx, "cy": cy, "bbox": bb})
+                    detections.append({"cx": cx, "cy": cy, "bbox": bb})
 
-        tracks = tracker.update(dets, frame_idx)
-        t_s = frame_idx / fps
-        near_miss.check(tracks, t_s, fps)
+        tracks = tracker.update(detections, frame_idx)
+        near_miss.check(tracks, frame_idx, fps)
 
+        # draw conflict zone
         cv2.rectangle(
             frame,
             (int(zx1), int(zy1)),
@@ -227,4 +232,8 @@ if run and uploaded:
 
     csv_path = os.path.join(tmp, "near_miss_events.csv")
     df.to_csv(csv_path, index=False)
-    st.download_button("Download Near-Miss CSV", open(csv_path, "rb"), "near_miss_events.csv")
+    st.download_button(
+        "Download Near-Miss CSV",
+        open(csv_path, "rb"),
+        "near_miss_events.csv",
+    )
