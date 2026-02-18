@@ -1,6 +1,6 @@
-# app.py — Forward Crossing + Calibrated MPH + Near Miss Detection (Single File)
+# app.py — Forward Crossing + Calibrated MPH + Near Miss Detection
 
-import os, json, time, tempfile
+import os, tempfile
 from collections import deque
 
 import cv2
@@ -13,11 +13,11 @@ CAR_CLASS_ID = 2
 
 YELLOW = (0, 255, 255)
 GREEN  = (0, 255, 0)
-CYAN   = (255, 255, 0)
-WHITE  = (255, 255, 255)
 RED    = (0, 0, 255)
 
-# ------------------------- Utils -------------------------
+# -------------------------------------------------------
+# Utility
+# -------------------------------------------------------
 
 def make_writer(path, fps, w, h):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -27,14 +27,9 @@ def bb_centroid(bb):
     x1, y1, x2, y2 = bb
     return (x1 + x2) / 2.0, (y1 + y2) / 2.0
 
-def side_of_line(px, py, x1, y1, x2, y2):
-    return (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
-
-def build_homography(px_points, rect_width_m, rect_length_m):
+def build_homography(px_points, rect_w, rect_l):
     src = np.array(px_points, dtype=np.float32)
-    dst = np.array([[0, 0], [rect_width_m, 0],
-                    [rect_width_m, rect_length_m],
-                    [0, rect_length_m]], dtype=np.float32)
+    dst = np.array([[0,0],[rect_w,0],[rect_w,rect_l],[0,rect_l]], dtype=np.float32)
     return cv2.getPerspectiveTransform(src, dst)
 
 def project_point(H, cx, cy):
@@ -42,17 +37,17 @@ def project_point(H, cx, cy):
     gp = cv2.perspectiveTransform(pt, H)[0][0]
     return float(gp[0]), float(gp[1])
 
-# ------------------------- Tracker -------------------------
+# -------------------------------------------------------
+# Tracker
+# -------------------------------------------------------
 
-class CarTracker:
+class Tracker:
 
-    def __init__(self, fps, H=None, speed_window=12, max_age=20):
-        self.fps = float(fps)
+    def __init__(self, fps, H=None):
+        self.fps = fps
         self.H = H
-        self.speed_window = int(speed_window)
-        self.max_age = int(max_age)
-        self.next_id = 1
         self.tracks = {}
+        self.next_id = 1
 
     def update(self, dets, frame_idx):
 
@@ -60,8 +55,10 @@ class CarTracker:
             matched = False
 
             for tid, tr in self.tracks.items():
-                if np.hypot(d["cx"] - tr["cx"],
-                            d["cy"] - tr["cy"]) < 60:
+
+                # FIXED HERE (using tr["curr"] instead of tr["cx"])
+                if np.hypot(d["cx"] - tr["curr"][0],
+                            d["cy"] - tr["curr"][1]) < 60:
 
                     tr["bbox"] = d["bbox"]
                     tr["prev"] = tr["curr"]
@@ -91,19 +88,21 @@ class CarTracker:
                     "prev": (d["cx"], d["cy"]),
                     "hist": hist,
                     "mph": None,
-                    "last": frame_idx,
-                    "crossed": False
+                    "last": frame_idx
                 }
 
                 d["id"] = tid
 
         return dets
 
-# ------------------------- Analysis -------------------------
+# -------------------------------------------------------
+# Analysis
+# -------------------------------------------------------
 
-def analyze(video_path, outdir,
-            H, enable_nm,
-            near_dist_m, near_ttc_s):
+def analyze(video_path, H,
+            enable_nm,
+            near_dist_m,
+            near_ttc_s):
 
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -111,13 +110,13 @@ def analyze(video_path, outdir,
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     model = YOLO("yolov8n.pt")
-    tracker = CarTracker(fps, H)
+    tracker = Tracker(fps, H)
 
-    annotated = os.path.join(outdir, "annotated.mp4")
-    writer = make_writer(annotated, fps, w, h)
+    out_path = "annotated_output.mp4"
+    writer = make_writer(out_path, fps, w, h)
 
     near_events = []
-    active_conflicts = set()
+    active_pairs = set()
 
     frame_idx = 0
 
@@ -136,15 +135,22 @@ def analyze(video_path, outdir,
 
                 bb = box.cpu().numpy()
                 cx, cy = bb_centroid(bb)
-                dets.append({"bbox": bb, "cx": cx, "cy": cy})
+
+                dets.append({
+                    "bbox": bb,
+                    "cx": cx,
+                    "cy": cy
+                })
 
         dets = tracker.update(dets, frame_idx)
 
-        # -------- SPEED --------
+        # -------- SPEED CALCULATION --------
         for tr in tracker.tracks.values():
             if H is not None and len(tr["hist"]) >= 2:
+
                 f0, x0, y0 = tr["hist"][-2]
                 f1, x1, y1 = tr["hist"][-1]
+
                 dt = (f1 - f0) / fps
                 if dt > 0:
                     dist = np.hypot(x1 - x0, y1 - y0)
@@ -171,7 +177,7 @@ def analyze(video_path, outdir,
 
                     dx = x2m - x1m
                     dy = y2m - y1m
-                    dist_m = float(np.hypot(dx, dy))
+                    dist_m = np.hypot(dx, dy)
 
                     if dist_m > near_dist_m:
                         continue
@@ -190,7 +196,7 @@ def analyze(video_path, outdir,
 
                             pair = tuple(sorted((id1, id2)))
 
-                            if pair not in active_conflicts:
+                            if pair not in active_pairs:
                                 near_events.append({
                                     "time_s": round(frame_idx / fps, 2),
                                     "car_1": id1,
@@ -200,7 +206,7 @@ def analyze(video_path, outdir,
                                     "speed_1_mph": t1["mph"],
                                     "speed_2_mph": t2["mph"]
                                 })
-                                active_conflicts.add(pair)
+                                active_pairs.add(pair)
 
                             conflict_ids.update([id1, id2])
 
@@ -211,8 +217,6 @@ def analyze(video_path, outdir,
 
             if tid in conflict_ids:
                 color = RED
-            elif tr["crossed"]:
-                color = GREEN
             else:
                 color = YELLOW
 
@@ -234,12 +238,11 @@ def analyze(video_path, outdir,
     writer.release()
 
     near_df = pd.DataFrame(near_events)
-    near_csv = os.path.join(outdir, "near_miss_events.csv")
-    near_df.to_csv(near_csv, index=False)
+    return out_path, near_df
 
-    return annotated, near_df
-
-# ------------------------- STREAMLIT UI -------------------------
+# -------------------------------------------------------
+# Streamlit UI
+# -------------------------------------------------------
 
 st.title("Traffic Analytics")
 
@@ -268,11 +271,12 @@ if run and uploaded:
         px_points = [(100,100),(300,100),(300,300),(100,300)]
         H = build_homography(px_points, 3.7, 10.0)
 
-    out, near_df = analyze(video_path, temp_dir,
-                           H, enable_nm,
-                           near_dist_m, near_ttc_s)
+    out_path, near_df = analyze(video_path, H,
+                                 enable_nm,
+                                 near_dist_m,
+                                 near_ttc_s)
 
-    st.video(out)
+    st.video(out_path)
 
     if not near_df.empty:
         st.subheader("Near Miss Events")
